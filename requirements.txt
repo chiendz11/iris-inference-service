@@ -1,0 +1,7 @@
+fastapi==0.119.1
+uvicorn[standard]==0.38.0
+mlflow==3.5.1
+pandas==2.3.3
+scikit-learn==1.7.2
+prometheus-client==0.23.1
+
