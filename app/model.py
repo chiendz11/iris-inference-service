@@ -6,7 +6,6 @@ import threading
 import mlflow
 import pandas as pd
 
-
 FEATURES = ["sepal_length", "sepal_width", "petal_length", "petal_width"]
 
 
