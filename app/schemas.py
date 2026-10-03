@@ -16,6 +16,7 @@ class PredictRequest(BaseModel):
 
 class PredictResponse(BaseModel):
     model_uri: str
+    model_version: str
     predictions: list[str]
 
 
@@ -36,4 +37,3 @@ class V2Input(BaseModel):
 class V2InferRequest(BaseModel):
     id: str | None = None
     inputs: list[V2Input] = Field(min_length=1, max_length=1)
-

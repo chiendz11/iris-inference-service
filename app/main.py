@@ -1,34 +1,31 @@
 from __future__ import annotations
 
 import logging
-import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from app.model import FEATURES, ModelManager
-from app.schemas import PredictRequest, PredictResponse, V2InferRequest
-
+from app.api.v1 import router as v1_router
+from app.api.v2 import router as v2_router
+from app.runtime import manager
 
 LOGGER = logging.getLogger(__name__)
-manager = ModelManager()
-REQUESTS = Counter("iris_prediction_requests_total", "Prediction requests", ["status"])
-PREDICTIONS = Counter("iris_predictions_total", "Predicted Iris classes", ["species"])
-LATENCY = Histogram("iris_prediction_latency_seconds", "Prediction request latency")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
         manager.load()
-        LOGGER.info("Loaded model %s", manager.model_uri)
+        LOGGER.info("Loaded model %s at immutable version %s", manager.model_uri, manager.model_version)
     except Exception:
         LOGGER.exception("Model load failed; readiness stays false")
     yield
 
 
-app = FastAPI(title="Iris inference service", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Iris inference service", version="1.0.0", lifespan=lifespan)
+app.include_router(v1_router)
+app.include_router(v2_router)
 
 
 @app.get("/health/live")
@@ -40,61 +37,13 @@ def live() -> dict[str, str]:
 def ready() -> dict[str, str]:
     if not manager.ready:
         raise HTTPException(status_code=503, detail=manager.error or "Model is not loaded")
-    return {"status": "ready", "model_uri": manager.model_uri}
-
-
-@app.get("/v2/health/live")
-def v2_live() -> dict[str, bool]:
-    return {"live": True}
-
-
-@app.get("/v2/health/ready")
-def v2_ready() -> dict[str, bool]:
-    if not manager.ready:
-        raise HTTPException(status_code=503, detail=manager.error or "Model is not loaded")
-    return {"ready": True}
-
-
-def _predict(rows: list[list[float]]) -> list[str]:
-    start = time.perf_counter()
-    try:
-        predictions = manager.predict(rows)
-        REQUESTS.labels(status="success").inc()
-        for prediction in predictions:
-            PREDICTIONS.labels(species=prediction).inc()
-        return predictions
-    except Exception as exc:
-        REQUESTS.labels(status="error").inc()
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    finally:
-        LATENCY.observe(time.perf_counter() - start)
-
-
-@app.post("/v1/models/iris:predict", response_model=PredictResponse)
-def predict(request: PredictRequest) -> PredictResponse:
-    rows = [[getattr(instance, feature) for feature in FEATURES] for instance in request.instances]
-    return PredictResponse(model_uri=manager.model_uri, predictions=_predict(rows))
-
-
-@app.post("/v2/models/iris/infer")
-def v2_infer(request: V2InferRequest) -> dict:
-    predictions = _predict(request.inputs[0].data)
     return {
-        "model_name": "iris",
-        "model_version": manager.model_uri,
-        "id": request.id,
-        "outputs": [
-            {
-                "name": "predict",
-                "shape": [len(predictions)],
-                "datatype": "BYTES",
-                "data": predictions,
-            }
-        ],
+        "status": "ready",
+        "model_uri": manager.model_uri,
+        "model_version": manager.model_version,
     }
 
 
 @app.get("/metrics")
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-

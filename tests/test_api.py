@@ -12,6 +12,7 @@ def setup_module():
     manager.model = FakeModel()
     manager.error = None
     manager.model_uri = "models:/iris-classifier@champion"
+    manager.model_version = "12"
 
 
 client = TestClient(app)
@@ -38,6 +39,7 @@ def test_v1_prediction_contract():
     )
     assert response.status_code == 200
     assert response.json()["predictions"] == ["setosa"]
+    assert response.json()["model_version"] == "12"
 
 
 def test_v2_prediction_contract():
@@ -57,6 +59,7 @@ def test_v2_prediction_contract():
     )
     assert response.status_code == 200
     assert response.json()["outputs"][0]["data"] == ["virginica"]
+    assert response.json()["model_version"] == "12"
 
 
 def test_rejects_wrong_feature_count():
@@ -66,3 +69,29 @@ def test_rejects_wrong_feature_count():
     )
     assert response.status_code == 422
 
+
+def test_classifier_alias_is_not_an_api_route():
+    response = client.post(
+        "/v1/models/iris-classifier:predict",
+        json={"instances": []},
+    )
+    assert response.status_code == 404
+
+
+def test_metrics_identify_immutable_model_version():
+    client.post(
+        "/v1/models/iris:predict",
+        json={
+            "instances": [
+                {
+                    "sepal_length": 5.1,
+                    "sepal_width": 3.5,
+                    "petal_length": 1.4,
+                    "petal_width": 0.2,
+                }
+            ]
+        },
+    )
+    metrics = client.get("/metrics").text
+    assert 'model_version="12"' in metrics
+    assert 'service="iris-classifier"' in metrics
