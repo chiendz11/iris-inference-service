@@ -160,6 +160,8 @@ def run_smoke(
             predictions = response.get("predictions")
             if not isinstance(response.get("model_uri"), str):
                 raise SmokeError("Prediction response is missing model_uri")
+            if not isinstance(response.get("model_version"), str):
+                raise SmokeError("Prediction response is missing model_version")
             if not isinstance(predictions, list) or len(predictions) != 1:
                 raise SmokeError(f"Invalid predictions field: {predictions}")
             prediction = predictions[0]

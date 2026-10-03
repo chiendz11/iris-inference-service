@@ -9,9 +9,62 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: inference-service-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  classify-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.changes.outputs.release }}
+      image: ${{ steps.changes.outputs.image }}
+      config: ${{ steps.changes.outputs.config }}
+      secret_refs: ${{ steps.changes.outputs.secret_refs }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Classify one workload release
+        id: changes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            changed="$(git ls-tree --name-only -r "${GITHUB_SHA}")"
+          else
+            changed="$(git diff --name-only "${BEFORE_SHA}" "${GITHUB_SHA}")"
+          fi
+
+          image=false
+          config=false
+          secret_refs=false
+          if grep -Eq '^(app/|Dockerfile$|pyproject\.toml$|requirements\.txt$)' <<<"${changed}"; then
+            image=true
+          fi
+          if grep -Eq '^(contracts/runtime-config-v[1-9][0-9]*\.schema\.json|release/config-schema-version\.txt|release/production-runtime-config\.json)$' <<<"${changed}"; then
+            config=true
+          fi
+          if grep -Eq '^release/production-secret-refs\.json$' <<<"${changed}"; then
+            secret_refs=true
+          fi
+          if [[ "${image}" == true || "${config}" == true || "${secret_refs}" == true ]]; then
+            release=true
+          else
+            release=false
+          fi
+          {
+            echo "release=${release}"
+            echo "image=${image}"
+            echo "config=${config}"
+            echo "secret_refs=${secret_refs}"
+          } >> "${GITHUB_OUTPUT}"
+
   test-and-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -19,25 +72,57 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements-dev.txt -e .
-      - run: ruff check app tests
+      - run: ruff check app tests tools
       - run: python -m pytest -q
-      - run: docker build -t iris-inference:${{ github.sha }} .
+      - name: Validate the reviewed production runtime values
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from jsonschema import Draft202012Validator
+
+          version = Path("release/config-schema-version.txt").read_text().strip()
+          assert version.startswith("v") and version[1:].isdigit() and int(version[1:]) > 0
+          schema = json.loads(Path(f"contracts/runtime-config-{version}.schema.json").read_text())
+          values = json.loads(Path("release/production-runtime-config.json").read_text())
+          Draft202012Validator.check_schema(schema)
+          Draft202012Validator(schema).validate(values)
+          assert values["DRIFT_MIN_SAMPLES"] <= values["DRIFT_WINDOW_SIZE"]
+          PY
+          jq -e 'type == "object"' release/production-secret-refs.json >/dev/null
+      - name: Build review image
+        run: |
+          docker build \
+            --build-arg SOURCE_REVISION="${GITHUB_SHA}" \
+            --tag "iris-inference:${GITHUB_SHA}" .
+      - name: Block fixable critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: iris-inference:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL
 
   ci-gate:
     name: ci-gate
     if: always()
     needs: test-and-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require validation to pass
         env:
           TEST_AND_BUILD_RESULT: ${{ needs.test-and-build.result }}
         run: test "${TEST_AND_BUILD_RESULT}" = success
 
-  publish-and-propose:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: test-and-build
-    runs-on: ubuntu-latest
+  publish-workload-release:
+    if: >-
+      ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          needs.classify-release.outputs.release == 'true' }}
+    needs: [classify-release, test-and-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     environment: prod
     permissions:
       contents: read
@@ -46,54 +131,156 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.INFERENCE_ECR_REPOSITORY }}
       GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+      PUBLISH_IMAGE: ${{ needs.classify-release.outputs.image }}
+      PUBLISH_CONFIG: ${{ needs.classify-release.outputs.config }}
+      PUBLISH_SECRET_REFS: ${{ needs.classify-release.outputs.secret_refs }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - run: docker build -t iris-inference:${{ github.sha }} .
+
+      - name: Build immutable release candidate without cloud credentials
+        if: env.PUBLISH_IMAGE == 'true'
+        run: |
+          docker build \
+            --build-arg SOURCE_REVISION="${GITHUB_SHA}" \
+            --tag "iris-inference:${GITHUB_SHA}" .
+
+      - name: Block fixable critical vulnerabilities before publication
+        if: env.PUBLISH_IMAGE == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: iris-inference:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL
+
       - name: Assume AWS deploy role
+        if: env.PUBLISH_IMAGE == 'true'
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
       - name: Login to ECR
+        if: env.PUBLISH_IMAGE == 'true'
         id: ecr
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
       - name: Push immutable image
+        if: env.PUBLISH_IMAGE == 'true'
+        id: publish
         run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
-          docker tag iris-inference:${{ github.sha }} "${IMAGE}"
-          docker push "${IMAGE}"
-          echo "IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
-      - name: Mint short-lived GitOps pull-request token
-        id: gitops-token
+          set -euo pipefail
+          image_repository="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}"
+          image="${image_repository}:${GITHUB_SHA}"
+          image_digest="$(aws ecr batch-get-image \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${GITHUB_SHA}" \
+            --query 'images[0].imageId.imageDigest' \
+            --output text 2>/dev/null || true)"
+          if [[ ! "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            docker tag "iris-inference:${GITHUB_SHA}" "${image}"
+            docker push "${image}"
+          fi
+          for _ in {1..10}; do
+            image_digest="$(aws ecr batch-get-image \
+              --repository-name "${ECR_REPOSITORY}" \
+              --image-ids "imageTag=${GITHUB_SHA}" \
+              --query 'images[0].imageId.imageDigest' \
+              --output text 2>/dev/null || true)"
+            [[ "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] && break
+            sleep 2
+          done
+          [[ "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "image_repository=${image_repository}"
+            echo "image_digest=${image_digest}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Install Cosign
+        if: env.PUBLISH_IMAGE == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Keyless-sign immutable image digest
+        if: env.PUBLISH_IMAGE == 'true'
+        env:
+          COSIGN_YES: "true"
+          IMAGE_REPOSITORY: ${{ steps.publish.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.publish.outputs.image_digest }}
+        run: cosign sign "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
+      - name: Resolve GitOps dispatch target
+        id: gitops-target
+        run: |
+          set -euo pipefail
+          [[ "${GITOPS_REPOSITORY}" =~ ^[^/]+/[^/]+$ ]]
+          echo "repository_name=${GITOPS_REPOSITORY#*/}" >> "${GITHUB_OUTPUT}"
+
+      - name: Mint short-lived intent publisher token
+        id: intent-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ vars.GITOPS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.INTENT_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INTENT_PUBLISHER_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: iris-gitops
-          permission-contents: write
-          permission-pull-requests: write
-      - name: Checkout production desired state
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: ${{ env.GITOPS_REPOSITORY }}
-          token: ${{ steps.gitops-token.outputs.token }}
-          persist-credentials: false
-          path: gitops
-      - name: Open GitOps deployment pull request
+          repositories: ${{ steps.gitops-target.outputs.repository_name }}
+          permission-actions: write
+
+      - name: Publish one versioned workload-release intent
         env:
-          GH_TOKEN: ${{ steps.gitops-token.outputs.token }}
+          GH_TOKEN: ${{ steps.intent-token.outputs.token }}
+          IMAGE_REPOSITORY: ${{ steps.publish.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.publish.outputs.image_digest }}
         run: |
-          cd gitops
-          BRANCH="deploy/inference-${{ github.sha }}-${{ github.run_attempt }}"
-          git checkout -b "${BRANCH}"
-          sed -i -E "s|image: .*|image: ${IMAGE}|" environments/production/inference-service/inferenceservice.yaml
-          git config user.name "iris-mlops-bot"
-          git config user.email "iris-mlops-bot@users.noreply.github.com"
-          git add -- environments/production/inference-service/inferenceservice.yaml
-          git commit -m "deploy(inference): ${{ github.sha }}"
-          gh auth setup-git
-          git push origin "${BRANCH}"
-          gh pr create --repo "${GITOPS_REPOSITORY}" --base main --head "${BRANCH}" \
-            --title "deploy(inference): ${{ github.sha }}" \
-            --body "Promote inference image built from ${{ github.repository }}@${{ github.sha }}."
+          set -euo pipefail
+          contract="$(jq -cn \
+            --arg contract_version v1 \
+            --arg kind workload_release \
+            --arg component inference \
+            --arg environment production \
+            --arg source_repository "${GITHUB_REPOSITORY}" \
+            --arg source_sha "${GITHUB_SHA}" \
+            --arg change_id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            '{contract_version:$contract_version,kind:$kind,component:$component,environment:$environment,source_repository:$source_repository,source_sha:$source_sha,change_id:$change_id}')"
+          if [[ "${PUBLISH_IMAGE}" == true || "${PUBLISH_CONFIG}" == true ]]; then
+            schema_version="$(tr -d '[:space:]' < release/config-schema-version.txt)"
+            [[ "${schema_version}" =~ ^v[1-9][0-9]*$ ]]
+            schema_path="contracts/runtime-config-${schema_version}.schema.json"
+            test -f "${schema_path}"
+            required_config="$(jq --compact-output '.required' "${schema_path}")"
+            schema_digest="sha256:$(sha256sum "${schema_path}" | cut -d' ' -f1)"
+            contract="$(jq -cn \
+              --argjson contract "${contract}" \
+              --arg version "${schema_version}" \
+              --arg digest "${schema_digest}" \
+              --argjson required "${required_config}" \
+              '$contract + {config_schema_version:$version,config_schema_digest:$digest,required_config:$required}')"
+          fi
+          if [[ "${PUBLISH_CONFIG}" == true ]]; then
+            runtime_config="$(jq --compact-output . release/production-runtime-config.json)"
+            contract="$(jq -cn \
+              --argjson contract "${contract}" \
+              --argjson runtime_config "${runtime_config}" \
+              '$contract + {runtime_config:$runtime_config}')"
+          fi
+          if [[ "${PUBLISH_SECRET_REFS}" == true ]]; then
+            secret_refs="$(jq --compact-output . release/production-secret-refs.json)"
+            contract="$(jq -cn \
+              --argjson contract "${contract}" \
+              --argjson secret_refs "${secret_refs}" \
+              '$contract + {secret_refs:$secret_refs}')"
+          fi
+          if [[ "${PUBLISH_IMAGE}" == true ]]; then
+            contract="$(jq -cn \
+              --argjson contract "${contract}" \
+              --arg repository "${IMAGE_REPOSITORY}" \
+              --arg digest "${IMAGE_DIGEST}" \
+              '$contract + {image:{repository:$repository,digest:$digest}}')"
+          fi
+          jq -n \
+            --arg contract "${contract}" \
+            '{ref:"main",inputs:{contract:$contract}}' \
+            | gh api --method POST \
+                "repos/${GITOPS_REPOSITORY}/actions/workflows/workload-release.yml/dispatches" \
+                --input -
